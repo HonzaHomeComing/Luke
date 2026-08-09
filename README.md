@@ -2,24 +2,21 @@
 
 All tools are **one `.py` file**. No pip packages.
 
-## Save editor (what you want now) — `wunderwaffe_save_editor.py`
+## Save editor — `wunderwaffe_save_editor.py`
 
-Decrypts a save so your friend can edit values himself.
+Decrypts a save into a **readable report** + editable JSON.
 
 ### Steps
 1. Install Python 3.10+ (check **Add Python to PATH**)
 2. **Close the game**
 3. Double-click `wunderwaffe_save_editor.py` (or `run_save_editor.bat`)
 4. Click **Decrypt save…** → pick a file in `SaveGame`
-5. Open **`editable_values.json`** in Notepad
-6. Change `"new_value"` (example: `120` → `9999999`)
-7. Click **Apply edits…** → select that JSON
+5. Open **`readable_report.txt`** first (clean summary)
+6. Edit **`editable_values.json`** — change `"new_value"`
+7. Click **Apply edits…**
 8. Load the save in-game
 
-Also created next to it:
-- `decoded_strings.txt` — readable text from the save (search Front / Days)
-- `original_save.bak` — untouched copy
-- `READ_ME.txt` — same instructions
+Note: mid-game saves often no longer contain `120`. If the report still looks useless, upload the raw save file so it can be reverse-engineered properly.
 
 ### CLI
 ```bat

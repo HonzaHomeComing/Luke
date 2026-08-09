@@ -18,10 +18,13 @@ def encode_minus1(text: str) -> bytes:
 class SaveEditorTests(unittest.TestCase):
     def test_decrypt_and_apply_roundtrip(self) -> None:
         blob = (
-            encode_minus1("FrontDays")
+            encode_minus1("/Game/Mechanics/Grid")
             + b"\x00\x00\x00\x00"
             + struct.pack("<i", 120)
             + b"\x00\x00"
+            + encode_minus1("BP_Tile_Resource_Gold")
+            + b"\x00\x00"
+            + struct.pack("<i", 45)
         )
         with tempfile.TemporaryDirectory() as tmp:
             save = Path(tmp) / "continue_save_game_pww"
@@ -29,16 +32,16 @@ class SaveEditorTests(unittest.TestCase):
             out = editor.decrypt_save(save, Path(tmp) / "out")
 
             self.assertTrue((out / "editable_values.json").exists())
-            self.assertTrue((out / "decoded_strings.txt").exists())
-            text = (out / "decoded_strings.txt").read_text(encoding="utf-8")
-            self.assertIn("FrontDays", text)
+            self.assertTrue((out / "readable_report.txt").exists())
+            report = (out / "readable_report.txt").read_text(encoding="utf-8")
+            self.assertIn("/Game/Mechanics/Grid", report)
 
             payload = json.loads((out / "editable_values.json").read_text(encoding="utf-8"))
-            self.assertTrue(payload["values"])
-            # edit first matching 120
+            self.assertGreater(len(payload["values"]), 0)
+
             edited = False
             for row in payload["values"]:
-                if row["current_value"] == 120:
+                if row["current_value"] == 120 and row["type"] == "int32_le":
                     row["new_value"] = 9999999
                     edited = True
                     break

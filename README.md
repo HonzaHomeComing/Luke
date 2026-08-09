@@ -16,7 +16,16 @@ Decrypts a save into a **readable report** + editable JSON.
 7. Click **Apply edits…**
 8. Load the save in-game
 
-Note: mid-game saves often no longer contain `120`. If the report still looks useless, upload the raw save file so it can be reverse-engineered properly.
+### Important finding
+Steam `SaveGame\save_game_pww_*` files are **Main_Level base layouts** (rooms/resources).
+They do **not** store the front-day timer.
+
+Also check:
+```
+%LOCALAPPDATA%\ProjectWunderwaffe\
+%LOCALAPPDATA%\ProjectWunderwaffe\Saved\SaveGames\
+```
+Or start a **new game**, save immediately at ~120 days, and decrypt that.
 
 ### CLI
 ```bat

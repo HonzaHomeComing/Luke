@@ -4,5 +4,6 @@ __pycache__/
 .venv/
 venv/
 scan_logs/
+save_analysis/
 *.log
 .DS_Store

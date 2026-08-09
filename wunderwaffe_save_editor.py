@@ -36,7 +36,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 DEFAULT_GAME_ROOTS = [
     r"C:\Program Files (x86)\Steam\steamapps\common\Project Wunderwaffe",
@@ -284,6 +284,26 @@ def write_readable_report(
     (out_dir / "readable_report.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _decode_inplace_view(data: bytes) -> bytes:
+    """Decode obfuscated path/name strings (byte-1) in place for a readable view."""
+    out = bytearray(data)
+    for m in re.finditer(rb"[\x20-\x7e]{4,}", data):
+        raw = m.group()
+        dec = decode_plus1(raw)
+        raw_s = raw.decode("ascii")
+        dec_s = dec.decode("ascii", "ignore")
+        score_raw = sum(ch.isalpha() or ch in "/_." for ch in raw_s)
+        score_dec = sum(ch.isalpha() or ch in "/_." for ch in dec_s)
+        if (
+            "/Game/" in dec_s
+            or dec_s.startswith("BP_")
+            or dec_s.startswith("Resource_")
+            or score_dec > score_raw + 2
+        ):
+            out[m.start() : m.end()] = dec
+    return bytes(out)
+
+
 def decrypt_save(save_path: Path, out_dir: Path | None = None) -> Path:
     save_path = save_path.resolve()
     data = save_path.read_bytes()
@@ -292,9 +312,26 @@ def decrypt_save(save_path: Path, out_dir: Path | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     shutil.copy2(save_path, out_dir / "original_save.bak")
+    # Also keep a binary copy with original name (for .txt uploads)
+    (out_dir / "restored_original.bin").write_bytes(data)
+
     strings = extract_real_strings(data)
     values = find_editable_values(data)
     write_readable_report(out_dir, save_path, data, strings, values)
+
+    # Full decoded ascii map (what humans should read)
+    view = _decode_inplace_view(data)
+    lines = [
+        f"# Fully decoded text view of {save_path.name}",
+        f"# size={len(data)}  tool={VERSION}",
+        "# Path/name strings use cipher: stored_byte = real_byte - 1",
+        "",
+    ]
+    for i in range(0, len(view), 80):
+        chunk = view[i : i + 80]
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{i:08x}  {asc}")
+    (out_dir / "full_decoded_view.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     # Clean strings-only file
     s_lines = ["decoded_text\traw_stored\toffsets", "-" * 40]
@@ -302,17 +339,33 @@ def decrypt_save(save_path: Path, out_dir: Path | None = None) -> Path:
         s_lines.append(f"{dec}\t{raw}\t@{off}")
     (out_dir / "decoded_strings.txt").write_text("\n".join(s_lines) + "\n", encoding="utf-8")
 
+    is_main_level = data[4:14] == b"Main_Level"
+    has_front_day = any(
+        any(w in dec.lower() for w in ("day", "front", "timer", "invas"))
+        for _o, _r, dec in strings
+    )
+
+    warning = []
+    if is_main_level and not has_front_day:
+        warning = [
+            "WARNING: This looks like a Main_Level base/layout save.",
+            "It has rooms/resources but NO Day/Front timer fields.",
+            "The 120-day front timer is probably in another file:",
+            "  %LOCALAPPDATA%\\ProjectWunderwaffe\\  or  ...\\Saved\\SaveGames\\",
+            "Or start a NEW game, save immediately, and decrypt that instead.",
+        ]
+
     editable = {
         "tool_version": VERSION,
         "save_file": str(save_path),
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "save_kind": "Main_Level base layout" if is_main_level else "unknown",
+        "contains_day_or_front_strings": has_front_day,
+        "warning": warning,
         "instructions": [
-            "Read readable_report.txt first.",
-            "Change new_value on rows you want (example: 45 -> 9999999).",
-            "Do NOT change offset or type.",
-            "Save this JSON, then click Apply edits in the app.",
-            "Higher score = more likely related to days/fronts.",
-            "Mid-game saves often no longer contain 120.",
+            "Read readable_report.txt and full_decoded_view.txt first.",
+            "If warning says no Day/Front fields, editing numbers here won't change the timer.",
+            "Otherwise change new_value, save JSON, then Apply edits.",
         ],
         "values": values,
     }
@@ -321,20 +374,23 @@ def decrypt_save(save_path: Path, out_dir: Path | None = None) -> Path:
     )
 
     (out_dir / "READ_ME.txt").write_text(
-        f"""HOW TO EDIT
-===========
-1. Open readable_report.txt  (this is the clean summary)
-2. Open editable_values.json in Notepad
-3. Change "new_value" on the rows you want
-4. Save JSON → run app → Apply edits → pick this JSON
-5. Load the save in-game
-
+        f"""HOW TO USE THIS FOLDER
+======================
 Save: {save_path}
-Candidates found: {len(values)}
-Decoded strings found: {len(strings)}
+Kind: {'Main_Level base layout' if is_main_level else 'unknown'}
+Day/Front strings found: {has_front_day}
+Candidates listed: {len(values)}
+Decoded strings: {len(strings)}
 
-If values is empty or nothing looks like a day timer, upload the
-original save file (and this folder) so it can be reverse-engineered.
+Files:
+  full_decoded_view.txt   ← browse the save as readable text
+  readable_report.txt     ← summary
+  decoded_strings.txt     ← path/name catalog
+  editable_values.json    ← numbers you can patch (if relevant)
+  restored_original.bin   ← exact binary bytes of the save
+  original_save.bak       ← backup copy
+
+{chr(10).join(warning) if warning else "If you see Front/Days values, edit editable_values.json then Apply."}
 """,
         encoding="utf-8",
     )

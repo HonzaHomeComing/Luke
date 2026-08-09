@@ -1,4 +1,4 @@
-"""Smoke tests for Phase 1 scanner using synthetic fixtures."""
+"""Smoke tests for the all-in-one scanner."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from wunderwaffe_scanner.scanner import scan_game_root, write_logs
+import wunderwaffe_scanner as scanner
 
 
 class ScannerTests(unittest.TestCase):
@@ -18,16 +18,15 @@ class ScannerTests(unittest.TestCase):
             (root / "config.json").write_text(
                 '{"frontDays": 120, "name": "east"}\n', encoding="utf-8"
             )
-            blob = b"HEADER" + struct.pack("<i", 120) + b"daysleft\x00"
-            (root / "data.bin").write_bytes(blob)
+            (root / "data.bin").write_bytes(b"HEADER" + struct.pack("<i", 120) + b"daysleft\x00")
             (root / "noise.png").write_bytes(b"\x89PNG\r\n" + b"\x00" * 32)
 
-            report = scan_game_root(root)
+            report = scanner.scan_game_root(root)
             self.assertGreaterEqual(report.total_hits, 1)
             self.assertTrue(any(h.score >= 100 for h in report.top_candidates))
 
             out = root / "logs"
-            json_path, txt_path = write_logs(report, out)
+            json_path, txt_path = scanner.write_logs(report, out)
             self.assertTrue(json_path.exists())
             self.assertTrue(txt_path.exists())
             payload = json.loads(json_path.read_text(encoding="utf-8"))

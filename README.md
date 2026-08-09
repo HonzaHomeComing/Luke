@@ -1,34 +1,32 @@
-# Project Wunderwaffe — Day Timer Tools
+# Project Wunderwaffe — Save tools
 
-Two single-file Python apps (no pip packages).
+All tools are **one `.py` file**. No pip packages.
 
-## 1) Scanner — `wunderwaffe_scanner.py`
-Finds clues about the 120-day timer. Already done if you sent the logs.
+## Save editor (what you want now) — `wunderwaffe_save_editor.py`
 
-## 2) Patcher — `wunderwaffe_patcher.py`  ← use this now
+Decrypts a save so your friend can edit values himself.
 
-Your scan showed an **Unreal Engine** game. Save strings are stored as `byte - 1`
-(e.g. `F\`ld.Ldbg\`mhbr` → `Game/Mechanics`). The patcher uses that to find
-Front/Days fields and set them to **9999999**.
+### Steps
+1. Install Python 3.10+ (check **Add Python to PATH**)
+2. **Close the game**
+3. Double-click `wunderwaffe_save_editor.py` (or `run_save_editor.bat`)
+4. Click **Decrypt save…** → pick a file in `SaveGame`
+5. Open **`editable_values.json`** in Notepad
+6. Change `"new_value"` (example: `120` → `9999999`)
+7. Click **Apply edits…** → select that JSON
+8. Load the save in-game
 
-### Friend-proof steps
-1. Install Python 3.10+ (check **Add Python to PATH**).
-2. **Close Project Wunderwaffe.**
-3. Double-click `wunderwaffe_patcher.py`
-4. Confirm the game folder (Steam `...\Project Wunderwaffe`)
-5. Click **1) Analyze saves**
-6. Click **2) Patch selected/high scores**
-7. Click **3) Launch game**
+Also created next to it:
+- `decoded_strings.txt` — readable text from the save (search Front / Days)
+- `original_save.bak` — untouched copy
+- `READ_ME.txt` — same instructions
 
-Backups are written next to each save as `*.bak`.
-
-### Optional CLI
+### CLI
 ```bat
-python wunderwaffe_patcher.py --cli-analyze
-python wunderwaffe_patcher.py --cli-patch --launch
+python wunderwaffe_save_editor.py --decrypt "C:\...\SaveGame\continue_save_game_pww"
+python wunderwaffe_save_editor.py --apply "C:\...\continue_save_game_pww_decrypted\editable_values.json"
 ```
 
-### If patch finds nothing strong
-Also click **Analyze exe default**, then patch again.  
-If it still fails, send one save file from:
-`...\Project Wunderwaffe\ProjectWunderwaffe\SaveGame\`
+## Older tools
+- `wunderwaffe_scanner.py` — Phase 1 full-install scan (already used)
+- `wunderwaffe_patcher.py` — older auto-patcher (optional)

@@ -4,21 +4,21 @@ cd /d "%~dp0"
 
 where python >nul 2>nul
 if not errorlevel 1 (
-  python -m wunderwaffe_scanner
+  python "%~dp0wunderwaffe_scanner.py"
   if errorlevel 1 pause
   exit /b %errorlevel%
 )
 
 where python3 >nul 2>nul
 if not errorlevel 1 (
-  python3 -m wunderwaffe_scanner
+  python3 "%~dp0wunderwaffe_scanner.py"
   if errorlevel 1 pause
   exit /b %errorlevel%
 )
 
 where py >nul 2>nul
 if not errorlevel 1 (
-  py -3 -m wunderwaffe_scanner
+  py -3 "%~dp0wunderwaffe_scanner.py"
   if errorlevel 1 pause
   exit /b %errorlevel%
 )

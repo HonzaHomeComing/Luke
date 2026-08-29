@@ -8,3 +8,7 @@ scan_logs/
 .DS_Store
 node_modules/
 dist/
+
+# Generated at runtime by ghibli_scene_generator.py
+generate_scene.py
+ghibli_scene_render.png

@@ -13,7 +13,18 @@ You do **not** need the full `.blend` from the tutorial — the normal map is th
 blender anime-grass/anime_grass.blend
 ```
 
-Select `Ground` → modifier **AnimeGrass**. Move/scale the `TexSync` empty to slide the painted shadow pattern.
+## View it correctly
+Cel shading only shows in **Eevee Rendered** view (`Z` → Rendered). Solid looks flat.
+Engine: **Eevee** · View Transform: **Standard**. Click **Allow** if asked about scripts.
+
+## Shadows look wrong?
+Anime grass does **not** use real Eevee shadow maps (those make black acne on thin blades).
+Cel shadows come from the **normal map clumps** via Diffuse → Shader-to-RGB.
+
+- Keep **Render Properties → Shadows** off (this file ships that way)
+- Sun/Fill should have **Shadow** unchecked
+- Move/scale **`TexSync`** to slide/resize the painted clump shadows
+- Viewport must be **Rendered** (`Z` → Rendered)
 
 ## Rebuild
 ```bash

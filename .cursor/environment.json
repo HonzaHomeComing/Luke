@@ -1,0 +1,14 @@
+{
+  "name": "Luke — Wunderwaffe tools + FORGE 3D lab",
+  "install": "cd capability-lab && npm ci",
+  "terminals": [
+    {
+      "name": "capability-lab dev",
+      "command": "cd capability-lab && npm run dev -- --host 0.0.0.0 --port 5173",
+      "description": "Vite dev server for the FORGE 3D capability lab (http://localhost:5173)."
+    }
+  ],
+  "ports": [
+    { "name": "capability-lab dev server", "port": 5173 }
+  ]
+}

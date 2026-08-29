@@ -6,3 +6,5 @@ venv/
 scan_logs/
 *.log
 .DS_Store
+node_modules/
+dist/

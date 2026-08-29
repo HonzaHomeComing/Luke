@@ -15,15 +15,12 @@ blender anime-grass/anime_grass.blend
 
 ## View it correctly
 If the meadow looks flat / solid green with no painted shadows, you are in
-**Solid** viewport mode. The cel look is an Emission shader — it only appears
-in **Eevee Rendered** view.
-
-This `.blend` opens in Rendered by default. If yours looks flat:
+**Solid** viewport mode. The cel look is an Emission + Shader-to-RGB setup —
+it **only** appears in **Eevee Rendered** view. Solid mode always looks flat.
 
 1. Press `Z` → **Rendered** (or click the top-right shaded sphere)
-2. Render engine: **Eevee**
-3. Color Management → View Transform: **Standard**
-4. Confirm `GrassNormal` is packed (Image Editor → Image → Pack)
+2. If Blender asks to allow scripts, click **Allow** (auto-switches to Rendered)
+3. Render engine: **Eevee** · Color Management → View Transform: **Standard**
 
 Move/scale the `TexSync` empty to slide the painted shadow pattern.
 

@@ -580,8 +580,39 @@ def setup_scene():
     return cam, empty
 
 
+VIEWPORT_SCRIPT = "anime_grass_viewport.py"
+VIEWPORT_CODE = '''
+import bpy
+from bpy.app.handlers import persistent
+
+@persistent
+def anime_grass_force_rendered(_dummy):
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type != "VIEW_3D":
+                    continue
+                space.shading.type = "RENDERED"
+                if hasattr(space.shading, "use_scene_world"):
+                    space.shading.use_scene_world = True
+                if hasattr(space.shading, "use_scene_lights"):
+                    space.shading.use_scene_lights = True
+
+def register():
+    if anime_grass_force_rendered not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(anime_grass_force_rendered)
+    anime_grass_force_rendered(None)
+
+def unregister():
+    if anime_grass_force_rendered in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(anime_grass_force_rendered)
+'''.lstrip()
+
+
 def set_viewport_rendered():
-    """Cel/Emission shading only appears in Rendered view — save that as default."""
+    """Cel/Emission shading only appears in Rendered view."""
     for screen in bpy.data.screens:
         for area in screen.areas:
             if area.type != "VIEW_3D":
@@ -594,6 +625,19 @@ def set_viewport_rendered():
                     space.shading.use_scene_lights = True
                 if hasattr(space.shading, "use_scene_world"):
                     space.shading.use_scene_world = True
+
+
+def install_viewport_autorun():
+    """Auto-switch to Rendered on file open (requires Allow Script Execution)."""
+    text = bpy.data.texts.get(VIEWPORT_SCRIPT)
+    if text is None:
+        text = bpy.data.texts.new(VIEWPORT_SCRIPT)
+    text.clear()
+    text.write(VIEWPORT_CODE)
+    text.use_module = True
+    ns: dict = {}
+    exec(VIEWPORT_CODE, ns)
+    ns["register"]()
 
 
 def configure_render(scene):
@@ -610,6 +654,7 @@ def configure_render(scene):
     scene.frame_end = 48
     scene.render.fps = 24
     set_viewport_rendered()
+    install_viewport_autorun()
 
 
 def render_still(scene, path: Path, frame: int):

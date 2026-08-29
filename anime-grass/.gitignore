@@ -1,3 +1,4 @@
 renders/anim/
 *.blend1
 __pycache__/
+*.blend1

@@ -1,32 +1,28 @@
-# Anime Grass
+# Anime Grass (2026 workflow)
 
-Geometry Nodes meadow using the tutorial-style **normal map** workflow
-(hand-painted cel shadows via object-space normals + Shader-to-RGB).
+Rebuild of Trung Duy Nguyen’s **Anime Grass Tutorial | 2026 Update**
+([video](https://youtu.be/3F5qaLC8TRY)) for **Blender 5.2+**.
 
-## Assets
-- `textures/grass_normal.png` — the normal map you provided (drop-in replacement OK)
-
-You do **not** need the full `.blend` from the tutorial — the normal map is the key art.
+## What’s in here
+- `Scatter on Surface` (Blender essentials asset) for grass + flowers
+- Double-sided blade with **Data Transfer** flat normals (painterly)
+- Diffuse → Shader to RGB cel + **world-space** normal map via `TexSync` empty
+- Noise blur + world/tangent normal mix (tutorial tricks)
+- Texture mask for grass/dirt in the shader (instances stay light)
+- Simple wind injected into Scatter’s instance rotation
+- Shadows off (required for this look)
 
 ## Open
 ```bash
+# Blender 5.2+ (you’re on 5.2.1 — perfect)
 blender anime-grass/anime_grass.blend
 ```
-
-## View it correctly
-Cel shading only shows in **Eevee Rendered** view (`Z` → Rendered). Solid looks flat.
-Engine: **Eevee** · View Transform: **Standard**. Click **Allow** if asked about scripts.
-
-## Shadows look wrong?
-Anime grass does **not** use real Eevee shadow maps (those make black acne on thin blades).
-Cel shadows come from the **normal map clumps** via Diffuse → Shader-to-RGB.
-
-- Keep **Render Properties → Shadows** off (this file ships that way)
-- Sun/Fill should have **Shadow** unchecked
-- Move/scale **`TexSync`** to slide/resize the painted clump shadows
-- Viewport must be **Rendered** (`Z` → Rendered)
+`Z` → **Rendered**. Move/scale **`TexSync`** to slide the painted clumps.
 
 ## Rebuild
 ```bash
-blender --background --factory-startup --python anime-grass/build_anime_grass.py -- --stills-only
+/path/to/blender-5.2+ --background --factory-startup \
+  --python anime-grass/build_anime_grass.py -- --stills-only
 ```
+
+Needs Blender’s `geometry_nodes_essentials.blend` (ships with 5.x).

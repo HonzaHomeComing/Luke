@@ -1,27 +1,38 @@
 """
-Anime Grass — driven by the tutorial normal map you provided.
+Anime Grass — 2026 Trung Duy Nguyen workflow (Blender 5.x)
 
-Uses object-space normal mapping + Shader-to-RGB cel shading
-(the hand-painted shadow trick from the video).
+- Scatter on Surface (essentials asset)
+- Double-sided blade + Data Transfer flat normals from a plane
+- Diffuse → Shader to RGB cel
+- World-space normal map via Empty (object coords) + noise blur
+- Mix world + tangent normals (Linear Light)
+- Texture mask (instances stay light — no Realize)
+- Simple wind injected into Scatter's Instance on Points rotation
+- Shadows off
 
-  blender --background --factory-startup --python anime-grass/build_anime_grass.py -- --stills-only
+  /path/to/blender-5.2+ --background --factory-startup \\
+      --python anime-grass/build_anime_grass.py -- --stills-only
 """
 
 from __future__ import annotations
 
 import math
-import random
+import struct
 import sys
 import traceback
+import zlib
 from pathlib import Path
 
 import bpy
-from mathutils import Euler
+from mathutils import Euler, Vector
 
 ROOT = Path(__file__).resolve().parent
 BLEND_PATH = ROOT / "anime_grass.blend"
 RENDER_DIR = ROOT / "renders"
 NORMAL_PATH = ROOT / "textures" / "grass_normal.png"
+MASK_PATH = ROOT / "textures" / "grass_mask.png"
+ESSENTIALS = Path(bpy.path.abspath("//"))  # placeholder; resolved at runtime
+
 MASK_NAME = "Grass"
 WIND_ATTR = "wind"
 
@@ -30,18 +41,48 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def essentials_path() -> Path:
+    ver = f"{bpy.app.version[0]}.{bpy.app.version[1]}"
+    # Blender binary sibling datafiles
+    for base in (
+        Path(bpy.app.binary_path).resolve().parent / ver / "datafiles" / "assets" / "nodes",
+        Path(f"/tmp/blender-{ver}.1-linux-x64") / ver / "datafiles" / "assets" / "nodes",
+        Path("/tmp/blender-5.2.1-linux-x64/5.2/datafiles/assets/nodes"),
+    ):
+        p = base / "geometry_nodes_essentials.blend"
+        if p.exists():
+            return p
+    raise FileNotFoundError("geometry_nodes_essentials.blend not found")
+
+
 def clear_scene() -> None:
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete(use_global=False)
-    for coll in (bpy.data.node_groups, bpy.data.materials, bpy.data.meshes, bpy.data.images, bpy.data.lights, bpy.data.cameras):
+    for coll in (
+        bpy.data.node_groups,
+        bpy.data.materials,
+        bpy.data.meshes,
+        bpy.data.images,
+        bpy.data.lights,
+        bpy.data.cameras,
+    ):
         for block in list(coll):
-            coll.remove(block)
-    for block in list(bpy.data.collections):
-        if block != bpy.context.scene.collection:
             try:
-                bpy.data.collections.remove(block)
+                coll.remove(block)
             except Exception:
                 pass
+    master = bpy.context.scene.collection
+    for block in list(bpy.data.collections):
+        if block == master:
+            continue
+        try:
+            bpy.data.collections.remove(block)
+        except Exception:
+            pass
+
+
+def scene_col():
+    return bpy.context.scene.collection
 
 
 def link(nt, a, b):
@@ -57,100 +98,93 @@ def node(nt, bl_idname, loc=(0, 0), **kwargs):
     return n
 
 
-def add_socket(nt, name, in_out, socket_type, default=None, min_v=None, max_v=None):
-    item = nt.interface.new_socket(name=name, in_out=in_out, socket_type=socket_type)
-    if default is not None and hasattr(item, "default_value"):
-        item.default_value = default
-    if min_v is not None and hasattr(item, "min_value"):
-        item.min_value = min_v
-    if max_v is not None and hasattr(item, "max_value"):
-        item.max_value = max_v
-    return item
+def write_png_gray(path: Path, w: int, h: int, pixels: list[float]) -> None:
+    """Minimal grayscale PNG writer (no Pillow). pixels 0..1 row-major top-left."""
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)  # filter none
+        row = y  # already top-to-bottom for our painter
+        for x in range(w):
+            v = int(max(0, min(1, pixels[row * w + x])) * 255)
+            raw.extend((v, v, v))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # 8-bit RGB
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(png)
 
 
-def set_mod_input(obj, mod_name, socket_name, value, frame=None):
-    mod = obj.modifiers[mod_name]
-    ng = mod.node_group
-    for item in ng.interface.items_tree:
-        if getattr(item, "name", None) == socket_name and getattr(item, "in_out", "") == "INPUT":
-            mod[item.identifier] = value
-            if frame is not None:
-                obj.keyframe_insert(
-                    data_path=f'modifiers["{mod_name}"]["{item.identifier}"]',
-                    frame=frame,
-                )
-            return True
-    return False
+def make_path_mask(path: Path, size: int = 1024) -> Path:
+    """S-curve dirt path (black) through grass (white) — matches our meadow."""
+    pix = [1.0] * (size * size)
+    for y in range(size):
+        t = y / (size - 1)
+        cx = 0.5 + 0.22 * math.sin(t * math.pi * 2.0)
+        half = 0.07 + 0.02 * math.sin(t * math.pi * 3)
+        for x in range(size):
+            u = x / (size - 1)
+            d = abs(u - cx)
+            # soft edge
+            if d < half:
+                pix[y * size + x] = 0.0
+            elif d < half + 0.03:
+                pix[y * size + x] = (d - half) / 0.03
+    write_png_gray(path, size, size, pix)
+    return path
 
 
-def load_normal_image() -> bpy.types.Image:
-    if not NORMAL_PATH.exists():
-        raise FileNotFoundError(f"Missing normal map: {NORMAL_PATH}")
-    img = bpy.data.images.load(str(NORMAL_PATH))
-    img.colorspace_settings.name = "Non-Color"
-    img.name = "GrassNormal"
-    # Pack so the .blend works on other machines without the textures/ folder
+def load_image(path: Path, name: str, non_color: bool = True) -> bpy.types.Image:
+    img = bpy.data.images.load(str(path))
+    img.name = name
+    if non_color:
+        img.colorspace_settings.name = "Non-Color"
     if img.packed_file is None:
         img.pack()
     return img
 
 
 # ---------------------------------------------------------------------------
-# Assets — solid low-poly clumps (~tutorial 16-tri spirit)
+# Single double-sided blade with flat transferred normals (2026 tutorial)
 # ---------------------------------------------------------------------------
 
-def make_clump(name: str, seed: int) -> bpy.types.Object:
-    rng = random.Random(seed)
-    verts = []
-    faces = []
-    # 4–5 wide tapered blades in a tuft
-    for i in range(5):
-        yaw = i * (math.tau / 5) + rng.uniform(-0.25, 0.25)
-        h = rng.uniform(0.35, 0.55)
-        w = rng.uniform(0.035, 0.055)
-        lean = rng.uniform(0.02, 0.07)
-        bend = rng.uniform(0.03, 0.09)
-        cy, sy = math.cos(yaw), math.sin(yaw)
-        local = [
-            (-w, 0, 0),
-            (w, 0, 0),
-            (-w * 1.05, lean * 0.4, h * 0.4),
-            (w * 1.05, lean * 0.4, h * 0.4),
-            (-w * 0.45, lean * 0.8 + bend * 0.3, h * 0.75),
-            (w * 0.45, lean * 0.8 + bend * 0.3, h * 0.75),
-            (0.0, lean + bend, h),
-        ]
-        base = len(verts)
-        for lx, ly, lz in local:
-            verts.append((lx * cy - ly * sy, lx * sy + ly * cy, lz))
-        faces += [
-            (base, base + 1, base + 3, base + 2),
-            (base + 2, base + 3, base + 5, base + 4),
-            (base + 4, base + 5, base + 6),
-        ]
-
-    mesh = bpy.data.meshes.new(name)
+def make_grass_blade() -> bpy.types.Object:
+    # Simple tapered blade (YZ plane-ish)
+    h, w = 0.55, 0.045
+    verts = [
+        (-w, 0, 0),
+        (w, 0, 0),
+        (-w * 0.85, 0.04, h * 0.45),
+        (w * 0.85, 0.04, h * 0.45),
+        (-w * 0.35, 0.08, h * 0.8),
+        (w * 0.35, 0.08, h * 0.8),
+        (0.0, 0.11, h),
+    ]
+    faces = [(0, 1, 3, 2), (2, 3, 5, 4), (4, 5, 6)]
+    mesh = bpy.data.meshes.new("GrassBladeMesh")
     mesh.from_pydata(verts, [], faces)
     mesh.update()
-    obj = bpy.data.objects.new(name, mesh)
-    col = bpy.context.scene.collection
-    col.objects.link(obj)
+    obj = bpy.data.objects.new("GrassBlade", mesh)
+    bpy.context.scene.collection.objects.link(obj)
 
-    # Double-sided (tutorial)
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
+    # Double face
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_all(action="SELECT")
     bpy.ops.mesh.duplicate()
     bpy.ops.mesh.flip_normals()
-    bpy.ops.transform.shrink_fatten(value=0.006)
+    bpy.ops.transform.shrink_fatten(value=0.005)
     bpy.ops.object.mode_set(mode="OBJECT")
 
-    # Flat normals from a plane so each tuft shades painterly
-    plane_mesh = bpy.data.meshes.new(name + "_plane")
-    plane_mesh.from_pydata([(-1, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)], [], [(0, 1, 2, 3)])
-    plane = bpy.data.objects.new(name + "_plane", plane_mesh)
-    col.objects.link(plane)
+    # Flat painterly normals from a plane
+    bpy.ops.mesh.primitive_plane_add(size=2.0, location=(0, 0, 0))
+    plane = bpy.context.active_object
+    plane.name = "NormalSource"
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
     dt = obj.modifiers.new("FlatN", "DATA_TRANSFER")
     dt.object = plane
     dt.use_loop_data = True
@@ -158,166 +192,199 @@ def make_clump(name: str, seed: int) -> bpy.types.Object:
     dt.loop_mapping = "NEAREST_POLYNOR"
     bpy.ops.object.modifier_apply(modifier="FlatN")
     bpy.data.objects.remove(plane, do_unlink=True)
-    bpy.data.meshes.remove(plane_mesh)
 
     bpy.ops.object.shade_smooth()
-    if hasattr(obj.data, "use_auto_smooth"):
-        obj.data.use_auto_smooth = True
-        obj.data.auto_smooth_angle = math.radians(180)
+    if hasattr(mesh, "use_auto_smooth"):
+        mesh.use_auto_smooth = True
+        mesh.auto_smooth_angle = math.radians(180)
     try:
         bpy.ops.mesh.customdata_custom_splitnormals_add()
     except Exception:
         pass
+
+    # Origin at root, apply scale
+    obj.scale = (0.85, 0.85, 0.85)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     obj.select_set(False)
     return obj
 
 
-def make_flower(name: str) -> bpy.types.Object:
-    mesh = bpy.data.meshes.new(name)
-    # tiny 5-petal flat-ish bloom
+def make_flower() -> bpy.types.Object:
+    mesh = bpy.data.meshes.new("FlowerMesh")
     verts = [(0, 0, 0.02)]
     faces = []
     for i in range(5):
         a0 = i * math.tau / 5
         a1 = (i + 0.5) * math.tau / 5
         a2 = (i + 1) * math.tau / 5
-        for a, r, z in ((a0, 0.04, 0.02), (a1, 0.11, 0.05), (a2, 0.04, 0.02)):
+        for a, r, z in ((a0, 0.035, 0.02), (a1, 0.09, 0.045), (a2, 0.035, 0.02)):
             verts.append((math.cos(a) * r, math.sin(a) * r, z))
         b = 1 + i * 3
         faces.append((0, b, b + 1, b + 2))
     mesh.from_pydata(verts, [], faces)
     mesh.update()
-    obj = bpy.data.objects.new(name, mesh)
+    obj = bpy.data.objects.new("Flower", mesh)
     bpy.context.scene.collection.objects.link(obj)
     return obj
 
 
-def build_collections():
-    grass_col = bpy.data.collections.new("GrassClumps")
-    flower_col = bpy.data.collections.new("Flowers")
-    scene = bpy.context.scene.collection
-    scene.children.link(grass_col)
-    scene.children.link(flower_col)
-    for i, seed in enumerate((1, 2, 3, 4)):
-        c = make_clump(f"Clump_{i}", seed)
-        scene.objects.unlink(c)
-        grass_col.objects.link(c)
-        c.location = (0, 0, -50)
-    f = make_flower("Flower")
-    scene.objects.unlink(f)
-    flower_col.objects.link(f)
-    f.location = (0, 0, -50)
-    return grass_col, flower_col
-
-
-def create_ground(size=8.0, cuts=72):
+def create_ground(size=8.0, cuts=96):
     bpy.ops.mesh.primitive_grid_add(x_subdivisions=cuts, y_subdivisions=cuts, size=size)
     ground = bpy.context.active_object
     ground.name = "Ground"
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+    # Mild hill
     mesh = ground.data
+    for v in mesh.vertices:
+        x, y = v.co.x, v.co.y
+        v.co.z = 0.15 * math.sin(x * 0.55) * math.cos(y * 0.45) + 0.08 * math.sin((x + y) * 0.35)
+    mesh.update()
+
+    # Top-view UV (Project from view bounds equivalent)
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.uv.cube_project(cube_size=size)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    # Remap UV to 0..1 from XY bounds
+    uv = mesh.uv_layers.new(name="UVMap") if not mesh.uv_layers else mesh.uv_layers.active
+    for loop in mesh.loops:
+        co = mesh.vertices[loop.vertex_index].co
+        uv.data[loop.index].uv = ((co.x / size) + 0.5, (co.y / size) + 0.5)
+
+    # Color attribute for optional painting (also used to seed mask bake conceptually)
     attr = mesh.color_attributes.new(name=MASK_NAME, type="FLOAT_COLOR", domain="POINT")
     for i, v in enumerate(mesh.vertices):
         x, y = v.co.x, v.co.y
-        path = abs(y - 0.9 * math.sin(x * 0.65) - 0.2 * math.sin(x * 1.8))
-        dirt = 1.0 - min(1.0, max(0.0, (path - 0.4) / 0.38))
-        edge = max(abs(x), abs(y)) / (size * 0.5)
-        fade = 1.0 if edge < 0.9 else max(0.0, 1.0 - (edge - 0.9) / 0.1)
-        g = max(0.0, min(1.0, (1.0 - dirt) * fade))
+        t = (y / size) + 0.5
+        cx = 0.0 + 1.6 * math.sin(t * math.pi * 2.0)
+        half = 0.55
+        d = abs(x - cx)
+        g = 0.0 if d < half else min(1.0, (d - half) / 0.35)
         attr.data[i].color = (g, g, g, 1.0)
     return ground
 
 
 # ---------------------------------------------------------------------------
-# Material — YOUR normal map drives the hand-painted shadows
+# Material — 2026: Diffuse→S2RGB + world normal + blur + tangent mix
 # ---------------------------------------------------------------------------
 
-def make_grass_material(normal_img: bpy.types.Image, empty: bpy.types.Object) -> bpy.types.Material:
-    """Soft painted clump shading from the normal map — no Eevee shadows, no black cel."""
-    mat = bpy.data.materials.new("AnimeGrass")
+def make_shared_material(normal_img, mask_img, empty) -> bpy.types.Material:
+    mat = bpy.data.materials.new("AnimeGrass2026")
     mat.use_nodes = True
     mat.blend_method = "OPAQUE"
     if hasattr(mat, "shadow_method"):
         mat.shadow_method = "NONE"
     if hasattr(mat, "use_transparent_shadow"):
         mat.use_transparent_shadow = False
-    if hasattr(mat, "use_backface_culling"):
-        mat.use_backface_culling = False
 
     nt = mat.node_tree
     nt.nodes.clear()
-    out = node(nt, "ShaderNodeOutputMaterial", (1100, 40))
+    out = node(nt, "ShaderNodeOutputMaterial", (1400, 40))
 
-    texcoord = node(nt, "ShaderNodeTexCoord", (-1000, 40))
+    # --- Object-space projection via Empty (TexSync) ---
+    texcoord = node(nt, "ShaderNodeTexCoord", (-1200, 80))
     texcoord.object = empty
-    mapping = node(nt, "ShaderNodeMapping", (-800, 40))
-    mapping.inputs["Scale"].default_value = (0.10, 0.10, 0.10)
+    mapping = node(nt, "ShaderNodeMapping", (-1000, 80))
+    mapping.inputs["Scale"].default_value = (0.12, 0.12, 0.12)
     link(nt, texcoord.outputs["Object"], mapping.inputs["Vector"])
 
-    ntex = node(nt, "ShaderNodeTexImage", (-580, 40))
+    ntex = node(nt, "ShaderNodeTexImage", (-780, 120))
     ntex.image = normal_img
     ntex.interpolation = "Cubic"
     link(nt, mapping.outputs["Vector"], ntex.inputs["Vector"])
 
-    nmap = node(nt, "ShaderNodeNormalMap", (-360, -160))
-    nmap.space = "WORLD"
-    nmap.inputs["Strength"].default_value = 1.0
-    link(nt, ntex.outputs["Color"], nmap.inputs["Color"])
+    # Blur trick: high-frequency noise + Linear Light mix
+    noise = node(nt, "ShaderNodeTexNoise", (-780, -120))
+    noise.inputs["Scale"].default_value = 20000.0
+    noise.inputs["Detail"].default_value = 0.0
+    blur = node(nt, "ShaderNodeMix", (-560, 40), data_type="RGBA", blend_type="LINEAR_LIGHT")
+    blur.inputs["Factor"].default_value = 0.02
+    link(nt, ntex.outputs["Color"], blur.inputs["A"])
+    link(nt, noise.outputs["Color"], blur.inputs["B"])
 
-    # Shade factor = painted mounds · light (smooth 0..1)
-    light = node(nt, "ShaderNodeVectorMath", (-360, -320), operation="NORMALIZE")
-    light.inputs[0].default_value = (0.50, 0.45, 0.75)
-    ndot = node(nt, "ShaderNodeVectorMath", (-140, -240), operation="DOT_PRODUCT")
-    link(nt, nmap.outputs["Normal"], ndot.inputs[0])
-    link(nt, light.outputs["Vector"], ndot.inputs[1])
-    mapr = node(nt, "ShaderNodeMapRange", (60, -240))
-    mapr.clamp = True
-    mapr.inputs["From Min"].default_value = -0.05
-    mapr.inputs["From Max"].default_value = 0.65
-    mapr.inputs["To Min"].default_value = 0.0
-    mapr.inputs["To Max"].default_value = 1.0
-    link(nt, ndot.outputs["Value"], mapr.inputs["Value"])
+    nmap_world = node(nt, "ShaderNodeNormalMap", (-340, 80))
+    nmap_world.space = "WORLD"
+    nmap_world.inputs["Strength"].default_value = 1.6
+    link(nt, blur.outputs["Result"], nmap_world.inputs["Color"])
 
-    # Soft anime greens — shade stays readable (never near-black)
-    grass = node(nt, "ShaderNodeValToRGB", (280, -80))
-    grass.color_ramp.interpolation = "LINEAR"
-    grass.color_ramp.elements[0].position = 0.0
-    grass.color_ramp.elements[0].color = (0.20, 0.48, 0.14, 1)  # soft shade
-    grass.color_ramp.elements[1].position = 1.0
-    grass.color_ramp.elements[1].color = (0.78, 0.94, 0.40, 1)  # lit lime
-    mid = grass.color_ramp.elements.new(0.42)
-    mid.color = (0.42, 0.72, 0.22, 1)
-    link(nt, mapr.outputs["Result"], grass.inputs["Fac"])
+    nmap_tan = node(nt, "ShaderNodeNormalMap", (-340, -160))
+    nmap_tan.space = "TANGENT"
+    nmap_tan.inputs["Strength"].default_value = 1.0
+    # flat / slight — use blurred map at low strength for ground shape hint
+    link(nt, blur.outputs["Result"], nmap_tan.inputs["Color"])
+    nmap_tan.inputs["Strength"].default_value = 0.35
 
-    dirt = node(nt, "ShaderNodeValToRGB", (280, 160))
-    dirt.color_ramp.interpolation = "LINEAR"
-    dirt.color_ramp.elements[0].position = 0.0
-    dirt.color_ramp.elements[0].color = (0.50, 0.38, 0.24, 1)
-    dirt.color_ramp.elements[1].position = 1.0
-    dirt.color_ramp.elements[1].color = (0.86, 0.70, 0.48, 1)
-    link(nt, mapr.outputs["Result"], dirt.inputs["Fac"])
+    # Combine normals as colors via Linear Light (tutorial trick)
+    ncomb = node(nt, "ShaderNodeMix", (-100, 0), data_type="RGBA", blend_type="LINEAR_LIGHT")
+    ncomb.inputs["Factor"].default_value = 0.55
+    link(nt, nmap_world.outputs["Normal"], ncomb.inputs["A"])
+    link(nt, nmap_tan.outputs["Normal"], ncomb.inputs["B"])
 
-    attr = node(nt, "ShaderNodeAttribute", (60, 80))
-    attr.attribute_name = MASK_NAME
-    mix_t = node(nt, "ShaderNodeMix", (520, 40), data_type="RGBA")
-    link(nt, attr.outputs["Color"], mix_t.inputs["Factor"])
-    link(nt, dirt.outputs["Color"], mix_t.inputs["A"])
-    link(nt, grass.outputs["Color"], mix_t.inputs["B"])
+    # Rebuild a normal-ish vector from mixed RGB: use as Normal via Normal Map again
+    # Simpler: plug world normal into Diffuse; mix factor controls detail
+    # Use Vector Mix instead if available
+    try:
+        vmix = node(nt, "ShaderNodeMix", (-100, -200), data_type="VECTOR", blend_type="LINEAR_LIGHT")
+        vmix.inputs["Factor"].default_value = 0.25
+        link(nt, nmap_world.outputs["Normal"], vmix.inputs["A"])
+        link(nt, nmap_tan.outputs["Normal"], vmix.inputs["B"])
+        normal_out = vmix.outputs["Result"]
+    except Exception:
+        normal_out = nmap_world.outputs["Normal"]
 
-    wattr = node(nt, "ShaderNodeAttribute", (280, -280))
-    wattr.attribute_name = WIND_ATTR
-    wmul = node(nt, "ShaderNodeMath", (520, -280), operation="MULTIPLY")
-    wmul.inputs[1].default_value = 0.15
-    link(nt, wattr.outputs["Fac"], wmul.inputs[0])
-    mix_w = node(nt, "ShaderNodeMix", (720, 20), data_type="RGBA")
-    mix_w.inputs["B"].default_value = (0.22, 0.45, 0.14, 1)
-    link(nt, wmul.outputs["Value"], mix_w.inputs["Factor"])
-    link(nt, mix_t.outputs["Result"], mix_w.inputs["A"])
+    # Grass cel colors
+    diffuse_g = node(nt, "ShaderNodeBsdfDiffuse", (120, 120))
+    diffuse_g.inputs["Color"].default_value = (1, 1, 1, 1)
+    link(nt, normal_out, diffuse_g.inputs["Normal"])
+    s2r_g = node(nt, "ShaderNodeShaderToRGB", (320, 120))
+    link(nt, diffuse_g.outputs["BSDF"], s2r_g.inputs["Shader"])
+    ramp_g = node(nt, "ShaderNodeValToRGB", (520, 120))
+    ramp_g.color_ramp.interpolation = "CONSTANT"
+    ramp_g.color_ramp.elements[0].position = 0.0
+    ramp_g.color_ramp.elements[0].color = (0.22, 0.48, 0.14, 1)
+    ramp_g.color_ramp.elements[1].position = 0.52
+    ramp_g.color_ramp.elements[1].color = (0.70, 0.90, 0.32, 1)
+    mid = ramp_g.color_ramp.elements.new(0.38)
+    mid.color = (0.40, 0.70, 0.22, 1)
+    link(nt, s2r_g.outputs["Color"], ramp_g.inputs["Fac"])
 
-    emit = node(nt, "ShaderNodeEmission", (920, 20))
+    # Ground cel colors (softer normal strength feel via darker dirt bands)
+    diffuse_d = node(nt, "ShaderNodeBsdfDiffuse", (120, -160))
+    diffuse_d.inputs["Color"].default_value = (1, 1, 1, 1)
+    link(nt, nmap_world.outputs["Normal"], diffuse_d.inputs["Normal"])
+    s2r_d = node(nt, "ShaderNodeShaderToRGB", (320, -160))
+    link(nt, diffuse_d.outputs["BSDF"], s2r_d.inputs["Shader"])
+    ramp_d = node(nt, "ShaderNodeValToRGB", (520, -160))
+    ramp_d.color_ramp.interpolation = "CONSTANT"
+    ramp_d.color_ramp.elements[0].position = 0.0
+    ramp_d.color_ramp.elements[0].color = (0.42, 0.30, 0.18, 1)
+    ramp_d.color_ramp.elements[1].position = 0.55
+    ramp_d.color_ramp.elements[1].color = (0.82, 0.66, 0.44, 1)
+    link(nt, s2r_d.outputs["Color"], ramp_d.inputs["Fac"])
+
+    # Texture mask via same Empty (object-space sync — lattice idea from tutorial)
+    mask_map = node(nt, "ShaderNodeMapping", (-1000, 320))
+    mask_map.inputs["Location"].default_value = (0.5, 0.5, 0.0)
+    mask_map.inputs["Scale"].default_value = (0.125, 0.125, 0.125)
+    link(nt, texcoord.outputs["Object"], mask_map.inputs["Vector"])
+    mtex = node(nt, "ShaderNodeTexImage", (-780, 320))
+    mtex.image = mask_img
+    mtex.interpolation = "Closest"
+    link(nt, mask_map.outputs["Vector"], mtex.inputs["Vector"])
+
+    mix = node(nt, "ShaderNodeMix", (760, 20), data_type="RGBA")
+    link(nt, mtex.outputs["Color"], mix.inputs["Factor"])
+    link(nt, ramp_d.outputs["Color"], mix.inputs["A"])
+    link(nt, ramp_g.outputs["Color"], mix.inputs["B"])
+
+    emit = node(nt, "ShaderNodeEmission", (1000, 20))
     emit.inputs["Strength"].default_value = 1.0
-    link(nt, mix_w.outputs["Result"], emit.inputs["Color"])
+    link(nt, mix.outputs["Result"], emit.inputs["Color"])
     link(nt, emit.outputs["Emission"], out.inputs["Surface"])
+
+    # Silence unused
+    _ = ncomb
     return mat
 
 
@@ -335,200 +402,140 @@ def make_flower_material() -> bpy.types.Material:
 
 
 # ---------------------------------------------------------------------------
-# Geometry Nodes
+# Scatter on Surface + wind
 # ---------------------------------------------------------------------------
 
-def build_grass_nodes(grass_col, flower_col, grass_mat, flower_mat):
-    nt = bpy.data.node_groups.new("AnimeGrass", "GeometryNodeTree")
-    add_socket(nt, "Geometry", "INPUT", "NodeSocketGeometry")
-    add_socket(nt, "Density", "INPUT", "NodeSocketFloat", 90.0, 1.0, 300.0)
-    add_socket(nt, "Scale", "INPUT", "NodeSocketFloat", 1.1, 0.2, 3.0)
-    add_socket(nt, "Flower Density", "INPUT", "NodeSocketFloat", 2.0, 0.0, 20.0)
-    add_socket(nt, "Wind Speed", "INPUT", "NodeSocketFloat", 0.5, 0.0, 3.0)
-    add_socket(nt, "Wind Strength", "INPUT", "NodeSocketFloat", 0.32, 0.0, 1.5)
-    add_socket(nt, "Seed", "INPUT", "NodeSocketInt", 4, 0, 9999)
-    add_socket(nt, "Geometry", "OUTPUT", "NodeSocketGeometry")
+def load_scatter_group() -> bpy.types.NodeTree:
+    path = essentials_path()
+    with bpy.data.libraries.load(str(path), link=False) as (data_from, data_to):
+        data_to.node_groups = ["Scatter on Surface"]
+    src = bpy.data.node_groups.get("Scatter on Surface")
+    ng = src.copy()
+    ng.name = "AnimeScatterGrass"
+    return ng
 
-    nin = node(nt, "NodeGroupInput", (-1700, 40))
-    nout = node(nt, "NodeGroupOutput", (1500, 40))
 
-    named = node(nt, "GeometryNodeInputNamedAttribute", (-1500, -220), data_type="FLOAT_COLOR")
-    named.inputs["Name"].default_value = MASK_NAME
-    sep = node(nt, "FunctionNodeSeparateColor", (-1300, -220))
-    link(nt, named.outputs["Attribute"], sep.inputs["Color"])
-    mask = sep.outputs["Red"]
+def inject_wind(ng: bpy.types.NodeTree) -> None:
+    """Rotate instances with layered noise driven by frame — tutorial-style wind."""
+    iop = next(n for n in ng.nodes if n.bl_idname == "GeometryNodeInstanceOnPoints")
+    # Find existing rotation link
+    rot_in = iop.inputs["Rotation"]
+    from_sock = None
+    for l in list(rot_in.links):
+        from_sock = l.from_socket
+        ng.links.remove(l)
 
-    dens = node(nt, "ShaderNodeMath", (-1300, 140), operation="MULTIPLY")
-    link(nt, nin.outputs["Density"], dens.inputs[0])
-    link(nt, mask, dens.inputs[1])
+    # #frame → noise → euler
+    scene_time = node(ng, "GeometryNodeInputSceneTime", (iop.location.x - 700, iop.location.y - 280))
+    div = node(ng, "ShaderNodeMath", (iop.location.x - 520, iop.location.y - 280), operation="DIVIDE")
+    div.inputs[1].default_value = 24.0
+    link(ng, scene_time.outputs["Frame"], div.inputs[0])
 
-    dist = node(nt, "GeometryNodeDistributePointsOnFaces", (-1100, 160))
-    dist.distribute_method = "RANDOM"
-    link(nt, nin.outputs["Geometry"], dist.inputs["Mesh"])
-    link(nt, dens.outputs["Value"], dist.inputs["Density"])
-    link(nt, nin.outputs["Seed"], dist.inputs["Seed"])
+    pos = node(ng, "GeometryNodeInputPosition", (iop.location.x - 700, iop.location.y - 420))
+    noise1 = node(ng, "ShaderNodeTexNoise", (iop.location.x - 520, iop.location.y - 420))
+    noise1.inputs["Scale"].default_value = 0.35
+    noise1.inputs["Detail"].default_value = 2.0
+    link(ng, pos.outputs["Position"], noise1.inputs["Vector"])
 
-    # Wind
-    time = node(nt, "GeometryNodeInputSceneTime", (-1500, -420))
-    pos = node(nt, "GeometryNodeInputPosition", (-1500, -540))
-    wspeed = node(nt, "ShaderNodeMath", (-1300, -460), operation="MULTIPLY")
-    link(nt, time.outputs["Seconds"], wspeed.inputs[0])
-    link(nt, nin.outputs["Wind Speed"], wspeed.inputs[1])
-    wave = node(nt, "ShaderNodeTexNoise", (-1100, -400))
-    wave.noise_dimensions = "4D"
-    wave.inputs["Scale"].default_value = 0.3
-    link(nt, pos.outputs["Position"], wave.inputs["Vector"])
-    link(nt, wspeed.outputs["Value"], wave.inputs["W"])
-    flutter = node(nt, "ShaderNodeTexNoise", (-1100, -580))
-    flutter.noise_dimensions = "4D"
-    flutter.inputs["Scale"].default_value = 1.5
-    link(nt, pos.outputs["Position"], flutter.inputs["Vector"])
-    w2 = node(nt, "ShaderNodeMath", (-1300, -640), operation="MULTIPLY")
-    w2.inputs[1].default_value = 2.3
-    link(nt, wspeed.outputs["Value"], w2.inputs[0])
-    link(nt, w2.outputs["Value"], flutter.inputs["W"])
-    fl = node(nt, "ShaderNodeMath", (-900, -540), operation="MULTIPLY")
-    fl.inputs[1].default_value = 0.28
-    link(nt, flutter.outputs["Fac"], fl.inputs[0])
-    mixw = node(nt, "ShaderNodeMath", (-900, -400), operation="ADD")
-    link(nt, wave.outputs["Fac"], mixw.inputs[0])
-    link(nt, fl.outputs["Value"], mixw.inputs[1])
-    centered = node(nt, "ShaderNodeMath", (-720, -400), operation="SUBTRACT")
-    centered.inputs[1].default_value = 0.5
-    link(nt, mixw.outputs["Value"], centered.inputs[0])
-    wind = node(nt, "ShaderNodeMath", (-540, -400), operation="MULTIPLY")
-    link(nt, centered.outputs["Value"], wind.inputs[0])
-    link(nt, nin.outputs["Wind Strength"], wind.inputs[1])
-    wabs = node(nt, "ShaderNodeMath", (-540, -520), operation="ABSOLUTE")
-    link(nt, wind.outputs["Value"], wabs.inputs[0])
+    # animate by adding time to vector
+    addv = node(ng, "ShaderNodeVectorMath", (iop.location.x - 520, iop.location.y - 560), operation="ADD")
+    link(ng, pos.outputs["Position"], addv.inputs[0])
+    comb = node(ng, "ShaderNodeCombineXYZ", (iop.location.x - 700, iop.location.y - 560))
+    link(ng, div.outputs["Value"], comb.inputs["X"])
+    link(ng, comb.outputs["Vector"], addv.inputs[1])
+    link(ng, addv.outputs["Vector"], noise1.inputs["Vector"])
 
-    store = node(nt, "GeometryNodeStoreNamedAttribute", (-540, 80), data_type="FLOAT", domain="POINT")
-    store.inputs["Name"].default_value = WIND_ATTR
-    link(nt, dist.outputs["Points"], store.inputs["Geometry"])
-    link(nt, wabs.outputs["Value"], store.inputs["Value"])
+    mapr = node(ng, "ShaderNodeMapRange", (iop.location.x - 340, iop.location.y - 420))
+    mapr.inputs["From Min"].default_value = 0.3
+    mapr.inputs["From Max"].default_value = 0.7
+    mapr.inputs["To Min"].default_value = -0.25
+    mapr.inputs["To Max"].default_value = 0.35
+    link(ng, noise1.outputs["Fac"], mapr.inputs["Value"])
 
-    colinfo = node(nt, "GeometryNodeCollectionInfo", (-540, -100), transform_space="ORIGINAL")
-    colinfo.inputs["Collection"].default_value = grass_col
-    colinfo.inputs["Separate Children"].default_value = True
-    colinfo.inputs["Reset Children"].default_value = True
+    # Wind as X/Y euler tilt
+    eul = node(ng, "FunctionNodeEulerToRotation", (iop.location.x - 160, iop.location.y - 280))
+    comb_e = node(ng, "ShaderNodeCombineXYZ", (iop.location.x - 340, iop.location.y - 280))
+    link(ng, mapr.outputs["Result"], comb_e.inputs["X"])
+    mul_y = node(ng, "ShaderNodeMath", (iop.location.x - 340, iop.location.y - 360), operation="MULTIPLY")
+    mul_y.inputs[1].default_value = 0.6
+    link(ng, mapr.outputs["Result"], mul_y.inputs[0])
+    link(ng, mul_y.outputs["Value"], comb_e.inputs["Y"])
+    link(ng, comb_e.outputs["Vector"], eul.inputs["Euler"])
 
-    align = node(nt, "FunctionNodeAlignEulerToVector", (-320, 200), axis="Z")
-    link(nt, dist.outputs["Normal"], align.inputs["Vector"])
-    idn = node(nt, "GeometryNodeInputID", (-540, -240))
-    ryaw = node(nt, "FunctionNodeRandomValue", (-320, -40), data_type="FLOAT")
-    ryaw.inputs["Min"].default_value = 0.0
-    ryaw.inputs["Max"].default_value = math.tau
-    link(nt, idn.outputs["ID"], ryaw.inputs["ID"])
-    link(nt, nin.outputs["Seed"], ryaw.inputs["Seed"])
-    yaw = node(nt, "ShaderNodeCombineXYZ", (-140, -40))
-    link(nt, ryaw.outputs["Value"], yaw.inputs["Z"])
+    rot_rot = node(ng, "FunctionNodeRotateRotation", (iop.location.x - 40, iop.location.y - 120))
+    if from_sock is not None:
+        link(ng, from_sock, rot_rot.inputs["Rotation"])
+    link(ng, eul.outputs["Rotation"], rot_rot.inputs["Rotate By"])
+    link(ng, rot_rot.outputs["Rotation"], rot_in)
 
-    sample = node(nt, "GeometryNodeSampleNearestSurface", (-320, -240), data_type="FLOAT")
-    link(nt, nin.outputs["Geometry"], sample.inputs["Mesh"])
-    link(nt, mask, sample.inputs["Value"])
-    link(nt, pos.outputs["Position"], sample.inputs["Sample Position"])
 
-    rs = node(nt, "FunctionNodeRandomValue", (-320, -420), data_type="FLOAT")
-    rs.inputs["Min"].default_value = 0.7
-    rs.inputs["Max"].default_value = 1.4
-    link(nt, idn.outputs["ID"], rs.inputs["ID"])
-    seed2 = node(nt, "ShaderNodeMath", (-540, -480), operation="ADD")
-    seed2.inputs[1].default_value = 23
-    link(nt, nin.outputs["Seed"], seed2.inputs[0])
-    link(nt, seed2.outputs["Value"], rs.inputs["Seed"])
-    s1 = node(nt, "ShaderNodeMath", (-140, -360), operation="MULTIPLY")
-    link(nt, rs.outputs["Value"], s1.inputs[0])
-    link(nt, nin.outputs["Scale"], s1.inputs[1])
-    s2 = node(nt, "ShaderNodeMath", (40, -360), operation="MULTIPLY")
-    link(nt, s1.outputs["Value"], s2.inputs[0])
-    link(nt, sample.outputs["Value"], s2.inputs[1])
-    svec = node(nt, "ShaderNodeCombineXYZ", (200, -360))
-    link(nt, s2.outputs["Value"], svec.inputs[0])
-    link(nt, s2.outputs["Value"], svec.inputs[1])
-    link(nt, s2.outputs["Value"], svec.inputs[2])
+def set_mod(mod, name, value):
+    """Blender 5.x: set via getattr(modifier.properties.inputs, Socket_X).value"""
+    ng = mod.node_group
+    for item in ng.interface.items_tree:
+        if getattr(item, "name", None) == name and getattr(item, "in_out", "") == "INPUT":
+            sock = getattr(mod.properties.inputs, item.identifier)
+            if hasattr(sock, "value"):
+                sock.value = value
+                return True
+            return False
+    return False
 
-    ri = node(nt, "FunctionNodeRandomValue", (-140, -180), data_type="INT")
-    for sock in ri.inputs:
-        if sock.name == "Min" and sock.type == "INT":
-            sock.default_value = 0
-        if sock.name == "Max" and sock.type == "INT":
-            sock.default_value = 3
-    link(nt, idn.outputs["ID"], ri.inputs["ID"])
-    link(nt, nin.outputs["Seed"], ri.inputs["Seed"])
 
-    iop = node(nt, "GeometryNodeInstanceOnPoints", (200, 100))
-    link(nt, store.outputs["Geometry"], iop.inputs["Points"])
-    link(nt, colinfo.outputs["Instances"], iop.inputs["Instance"])
-    iop.inputs["Pick Instance"].default_value = True
-    link(nt, ri.outputs["Value"], iop.inputs["Instance Index"])
-    link(nt, align.outputs["Rotation"], iop.inputs["Rotation"])
-    link(nt, svec.outputs["Vector"], iop.inputs["Scale"])
+def setup_scatter(ground, blade, flower_col, mask_img):
+    ng = load_scatter_group()
+    inject_wind(ng)
+    mod = ground.modifiers.new("ScatterGrass", "NODES")
+    mod.node_group = ng
 
-    rot_yaw = node(nt, "GeometryNodeRotateInstances", (420, 100))
-    link(nt, iop.outputs["Instances"], rot_yaw.inputs["Instances"])
-    link(nt, yaw.outputs["Vector"], rot_yaw.inputs["Rotation"])
+    set_mod(mod, "Input Type", "Data-Block")
+    set_mod(mod, "Instance Type", "Object")
+    set_mod(mod, "Object", blade)
+    set_mod(mod, "Density Method", "Density")
+    set_mod(mod, "Distribution Method", "Random")
+    set_mod(mod, "Density", 380.0)
+    set_mod(mod, "Scale", (1.0, 1.0, 1.0))
+    set_mod(mod, "Randomize", True)
+    set_mod(mod, "Randomize Rotation", (0.05, 0.05, math.tau))
+    # Socket_41 is the float uniform scale randomize
+    try:
+        getattr(mod.properties.inputs, "Socket_41").value = 0.45
+    except Exception:
+        pass
+    set_mod(mod, "Align Rotation", True)
+    set_mod(mod, "Realize Instances", False)
+    set_mod(mod, "Keep Surface", True)
+    # Mask via Distribution Mask attribute "Grass" — image masking needs correct UVs;
+    # use attribute for growth, texture only in shader.
+    set_mod(mod, "Masking", False)
+    set_mod(mod, "Distribution Mask", 1.0)
+    # Try binding attribute
+    try:
+        sock = getattr(mod.properties.inputs, "Socket_2")
+        if hasattr(sock, "attribute_name"):
+            sock.attribute_name = MASK_NAME
+            sock.type = "ATTRIBUTE" if hasattr(sock, "type") else None
+    except Exception as e:
+        log(f"attr mask skip: {e}")
 
-    we = node(nt, "ShaderNodeCombineXYZ", (420, -160))
-    link(nt, wind.outputs["Value"], we.inputs["X"])
-    wz = node(nt, "ShaderNodeMath", (240, -240), operation="MULTIPLY")
-    wz.inputs[1].default_value = 0.3
-    link(nt, wind.outputs["Value"], wz.inputs[0])
-    link(nt, wz.outputs["Value"], we.inputs["Z"])
-    rot_w = node(nt, "GeometryNodeRotateInstances", (640, 60))
-    link(nt, rot_yaw.outputs["Instances"], rot_w.inputs["Instances"])
-    link(nt, we.outputs["Vector"], rot_w.inputs["Rotation"])
-
-    realize = node(nt, "GeometryNodeRealizeInstances", (840, 60))
-    link(nt, rot_w.outputs["Instances"], realize.inputs["Geometry"])
-    setm = node(nt, "GeometryNodeSetMaterial", (1040, 60))
-    setm.inputs["Material"].default_value = grass_mat
-    link(nt, realize.outputs["Geometry"], setm.inputs["Geometry"])
-
-    # Flowers
-    fd = node(nt, "ShaderNodeMath", (-1300, -760), operation="MULTIPLY")
-    link(nt, nin.outputs["Flower Density"], fd.inputs[0])
-    link(nt, mask, fd.inputs[1])
-    fdist = node(nt, "GeometryNodeDistributePointsOnFaces", (-1100, -760))
-    fdist.distribute_method = "RANDOM"
-    link(nt, nin.outputs["Geometry"], fdist.inputs["Mesh"])
-    link(nt, fd.outputs["Value"], fdist.inputs["Density"])
-    fseed = node(nt, "ShaderNodeMath", (-1300, -860), operation="ADD")
-    fseed.inputs[1].default_value = 91
-    link(nt, nin.outputs["Seed"], fseed.inputs[0])
-    link(nt, fseed.outputs["Value"], fdist.inputs["Seed"])
-    fcol = node(nt, "GeometryNodeCollectionInfo", (-860, -760), transform_space="ORIGINAL")
-    fcol.inputs["Collection"].default_value = flower_col
-    fcol.inputs["Separate Children"].default_value = True
-    fcol.inputs["Reset Children"].default_value = True
-    falign = node(nt, "FunctionNodeAlignEulerToVector", (-660, -680), axis="Z")
-    link(nt, fdist.outputs["Normal"], falign.inputs["Vector"])
-    fiop = node(nt, "GeometryNodeInstanceOnPoints", (-460, -760))
-    link(nt, fdist.outputs["Points"], fiop.inputs["Points"])
-    link(nt, fcol.outputs["Instances"], fiop.inputs["Instance"])
-    link(nt, falign.outputs["Rotation"], fiop.inputs["Rotation"])
-    frs = node(nt, "FunctionNodeRandomValue", (-660, -860), data_type="FLOAT")
-    frs.inputs["Min"].default_value = 0.8
-    frs.inputs["Max"].default_value = 1.5
-    fid = node(nt, "GeometryNodeInputID", (-860, -880))
-    link(nt, fid.outputs["ID"], frs.inputs["ID"])
-    link(nt, fseed.outputs["Value"], frs.inputs["Seed"])
-    link(nt, frs.outputs["Value"], fiop.inputs["Scale"])
-    freal = node(nt, "GeometryNodeRealizeInstances", (-260, -760))
-    link(nt, fiop.outputs["Instances"], freal.inputs["Geometry"])
-    fmat = node(nt, "GeometryNodeSetMaterial", (-60, -760))
-    fmat.inputs["Material"].default_value = flower_mat
-    link(nt, freal.outputs["Geometry"], fmat.inputs["Geometry"])
-
-    gmat = node(nt, "GeometryNodeSetMaterial", (1040, -80))
-    gmat.inputs["Material"].default_value = grass_mat
-    link(nt, nin.outputs["Geometry"], gmat.inputs["Geometry"])
-
-    join = node(nt, "GeometryNodeJoinGeometry", (1240, 20))
-    link(nt, gmat.outputs["Geometry"], join.inputs["Geometry"])
-    link(nt, setm.outputs["Geometry"], join.inputs["Geometry"])
-    link(nt, fmat.outputs["Geometry"], join.inputs["Geometry"])
-    link(nt, join.outputs["Geometry"], nout.inputs["Geometry"])
-    return nt
+    ng2 = load_scatter_group()
+    ng2.name = "AnimeScatterFlowers"
+    inject_wind(ng2)
+    mod2 = ground.modifiers.new("ScatterFlowers", "NODES")
+    mod2.node_group = ng2
+    set_mod(mod2, "Input Type", "Data-Block")
+    set_mod(mod2, "Instance Type", "Collection")
+    set_mod(mod2, "Collection", flower_col)
+    set_mod(mod2, "Pick Instance", True)
+    set_mod(mod2, "Density Method", "Density")
+    set_mod(mod2, "Density", 6.0)
+    set_mod(mod2, "Scale", (1.3, 1.3, 1.3))
+    set_mod(mod2, "Randomize", True)
+    set_mod(mod2, "Randomize Rotation", (0.0, 0.0, math.tau))
+    set_mod(mod2, "Realize Instances", False)
+    set_mod(mod2, "Keep Surface", True)
+    set_mod(mod2, "Masking", False)
+    return mod, mod2
 
 
 def setup_scene():
@@ -539,105 +546,40 @@ def setup_scene():
     nt.nodes.clear()
     out = node(nt, "ShaderNodeOutputWorld", (260, 0))
     bg = node(nt, "ShaderNodeBackground", (60, 0))
-    bg.inputs["Color"].default_value = (0.82, 0.90, 0.96, 1)
-    bg.inputs["Strength"].default_value = 0.45
+    bg.inputs["Color"].default_value = (0.78, 0.88, 0.95, 1)
+    bg.inputs["Strength"].default_value = 0.35
     link(nt, bg.outputs["Background"], out.inputs["Surface"])
 
     empty = bpy.data.objects.new("TexSync", None)
     empty.empty_display_type = "CUBE"
-    empty.empty_display_size = 3.0
-    empty.scale = (3.2, 3.2, 3.2)
-    bpy.context.collection.objects.link(empty)
+    empty.empty_display_size = 1.0
+    empty.scale = (8.0, 8.0, 8.0)
+    bpy.context.scene.collection.objects.link(empty)
 
     cam_data = bpy.data.cameras.new("Cam")
     cam = bpy.data.objects.new("Cam", cam_data)
-    bpy.context.collection.objects.link(cam)
+    bpy.context.scene.collection.objects.link(cam)
     cam_data.lens = 50
-    # Diamond isometric like the tutorial thumbnail
-    cam.location = (6.8, -6.8, 5.8)
+    cam.location = (7.2, -7.2, 6.2)
     cam.rotation_euler = Euler((math.radians(55), 0, math.radians(45)), "XYZ")
     bpy.context.scene.camera = cam
 
-    # Soft sun for Shader-to-RGB only — shadows stay OFF (thin grass acne).
     sun = bpy.data.objects.new("Sun", bpy.data.lights.new("Sun", "SUN"))
-    bpy.context.collection.objects.link(sun)
+    bpy.context.scene.collection.objects.link(sun)
     sun.rotation_euler = Euler((math.radians(42), math.radians(8), math.radians(135)), "XYZ")
-    sun.data.energy = 4.5
-    sun.data.angle = math.radians(12.0)
-    sun.data.color = (1.0, 0.98, 0.94)
+    sun.data.energy = 5.0
+    sun.data.angle = math.radians(10.0)
     if hasattr(sun.data, "use_shadow"):
         sun.data.use_shadow = False
 
     fill = bpy.data.objects.new("Fill", bpy.data.lights.new("Fill", "AREA"))
-    bpy.context.collection.objects.link(fill)
+    bpy.context.scene.collection.objects.link(fill)
     fill.location = (-5, -2, 3.5)
-    fill.rotation_euler = Euler((math.radians(65), 0, math.radians(-45)), "XYZ")
-    fill.data.energy = 2.5
-    fill.data.size = 9
-    fill.data.color = (0.75, 0.85, 1.0)
+    fill.data.energy = 3.0
+    fill.data.size = 8
     if hasattr(fill.data, "use_shadow"):
         fill.data.use_shadow = False
     return cam, empty
-
-
-VIEWPORT_SCRIPT = "anime_grass_viewport.py"
-VIEWPORT_CODE = '''
-import bpy
-from bpy.app.handlers import persistent
-
-@persistent
-def anime_grass_force_rendered(_dummy):
-    for screen in bpy.data.screens:
-        for area in screen.areas:
-            if area.type != "VIEW_3D":
-                continue
-            for space in area.spaces:
-                if space.type != "VIEW_3D":
-                    continue
-                space.shading.type = "RENDERED"
-                if hasattr(space.shading, "use_scene_world"):
-                    space.shading.use_scene_world = True
-                if hasattr(space.shading, "use_scene_lights"):
-                    space.shading.use_scene_lights = True
-
-def register():
-    if anime_grass_force_rendered not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(anime_grass_force_rendered)
-    anime_grass_force_rendered(None)
-
-def unregister():
-    if anime_grass_force_rendered in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(anime_grass_force_rendered)
-'''.lstrip()
-
-
-def set_viewport_rendered():
-    """Cel/Emission shading only appears in Rendered view."""
-    for screen in bpy.data.screens:
-        for area in screen.areas:
-            if area.type != "VIEW_3D":
-                continue
-            for space in area.spaces:
-                if space.type != "VIEW_3D":
-                    continue
-                space.shading.type = "RENDERED"
-                if hasattr(space.shading, "use_scene_lights"):
-                    space.shading.use_scene_lights = True
-                if hasattr(space.shading, "use_scene_world"):
-                    space.shading.use_scene_world = True
-
-
-def install_viewport_autorun():
-    """Auto-switch to Rendered on file open (requires Allow Script Execution)."""
-    text = bpy.data.texts.get(VIEWPORT_SCRIPT)
-    if text is None:
-        text = bpy.data.texts.new(VIEWPORT_SCRIPT)
-    text.clear()
-    text.write(VIEWPORT_CODE)
-    text.use_module = True
-    ns: dict = {}
-    exec(VIEWPORT_CODE, ns)
-    ns["register"]()
 
 
 def configure_render(scene):
@@ -647,7 +589,6 @@ def configure_render(scene):
     scene.render.resolution_y = 1600
     scene.render.image_settings.file_format = "PNG"
     scene.view_settings.view_transform = "Standard"
-    scene.view_settings.look = "None"
     if hasattr(scene.eevee, "taa_render_samples"):
         scene.eevee.taa_render_samples = 64
     if hasattr(scene.eevee, "use_shadows"):
@@ -655,8 +596,13 @@ def configure_render(scene):
     scene.frame_start = 1
     scene.frame_end = 48
     scene.render.fps = 24
-    set_viewport_rendered()
-    install_viewport_autorun()
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type == "VIEW_3D":
+                    space.shading.type = "RENDERED"
 
 
 def render_still(scene, path: Path, frame: int):
@@ -667,60 +613,50 @@ def render_still(scene, path: Path, frame: int):
 
 
 def build():
+    if bpy.app.version < (5, 0, 0):
+        raise RuntimeError("This 2026 grass build needs Blender 5.0+ (Scatter on Surface).")
+
     log("Clearing…")
     clear_scene()
-    log(f"Loading normal map: {NORMAL_PATH}")
-    normal_img = load_normal_image()
-    log("Assets…")
-    grass_col, flower_col = build_collections()
-    ground = create_ground()
-    cam, empty = setup_scene()
-    grass_mat = make_grass_material(normal_img, empty)
-    flower_mat = make_flower_material()
-    ground.data.materials.append(grass_mat)
-    ground.data.materials.append(flower_mat)
+    make_path_mask(MASK_PATH)
+    log(f"Loading normal: {NORMAL_PATH}")
+    normal_img = load_image(NORMAL_PATH, "GrassNormal", True)
+    mask_img = load_image(MASK_PATH, "GrassMask", True)
 
-    log("Geometry Nodes…")
-    nt = build_grass_nodes(grass_col, flower_col, grass_mat, flower_mat)
-    mod = ground.modifiers.new("AnimeGrass", "NODES")
-    mod.node_group = nt
+    cam, empty = setup_scene()
+    blade = make_grass_blade()
+    flower = make_flower()
+    flower_col = bpy.data.collections.new("Flowers")
+    bpy.context.scene.collection.children.link(flower_col)
+    bpy.context.scene.collection.objects.unlink(flower)
+    flower_col.objects.link(flower)
+    flower.location = (0, 0, -40)
+    blade.location = (0, 0, -40)
+
+    ground = create_ground()
+    mat = make_shared_material(normal_img, mask_img, empty)
+    flower_mat = make_flower_material()
+    ground.data.materials.append(mat)
+    blade.data.materials.append(mat)
+    flower.data.materials.append(flower_mat)
 
     if hasattr(ground, "visible_shadow"):
         ground.visible_shadow = False
+    if hasattr(blade, "visible_shadow"):
+        blade.visible_shadow = False
 
+    log("Scatter on Surface…")
+    setup_scatter(ground, blade, flower_col, mask_img)
     configure_render(bpy.context.scene)
-    set_mod_input(ground, "AnimeGrass", "Density", 110.0)
-    set_mod_input(ground, "AnimeGrass", "Scale", 1.15)
-    set_mod_input(ground, "AnimeGrass", "Flower Density", 2.4)
-    set_mod_input(ground, "AnimeGrass", "Wind Speed", 0.55)
-    set_mod_input(ground, "AnimeGrass", "Wind Strength", 0.28)
-    set_mod_input(ground, "AnimeGrass", "Wind Strength", 0.22, 1)
-    set_mod_input(ground, "AnimeGrass", "Wind Strength", 0.4, 24)
-    set_mod_input(ground, "AnimeGrass", "Wind Strength", 0.25, 48)
 
     RENDER_DIR.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(BLEND_PATH))
 
-    deps = bpy.context.evaluated_depsgraph_get()
-    ev = ground.evaluated_get(deps)
-    m = ev.to_mesh()
-    log(f"Evaluated verts: {len(m.vertices)}")
-    ev.to_mesh_clear()
-
-    scene = bpy.context.scene
     only_stills = "--stills-only" in sys.argv
+    scene = bpy.context.scene
     render_still(scene, RENDER_DIR / "anime_grass_hero", 24)
     render_still(scene, RENDER_DIR / "anime_grass_wind_a", 8)
     render_still(scene, RENDER_DIR / "anime_grass_wind_b", 40)
-
-    if not only_stills:
-        anim = RENDER_DIR / "anim"
-        anim.mkdir(exist_ok=True)
-        scene.render.resolution_x = 960
-        scene.render.resolution_y = 960
-        for f in range(1, 49, 2):
-            render_still(scene, anim / f"frame_{f:04d}", f)
-
     bpy.ops.wm.save_as_mainfile(filepath=str(BLEND_PATH))
     log(f"SAVED {BLEND_PATH}")
 

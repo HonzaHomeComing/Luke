@@ -165,7 +165,7 @@ export function DemoObject({
   meshRef,
 }: Props) {
   const local = useRef<Mesh>(null)
-  const activeMaterial = mode === 'materials' ? material : 'metal'
+  const activeMaterial = material
   const mat = materialProps(activeMaterial)
   const spin = mode === 'motion' || autoRotate
 

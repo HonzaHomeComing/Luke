@@ -146,7 +146,7 @@ export default function App() {
         <h3>{active.title}</h3>
         <p>{active.blurb}</p>
 
-        {(mode === 'shapes' || mode === 'motion') && (
+        {(mode === 'shapes' || mode === 'motion' || mode === 'materials') && (
           <div className="row">
             <label htmlFor="shape">Shape</label>
             <select
@@ -163,7 +163,7 @@ export default function App() {
           </div>
         )}
 
-        {mode === 'materials' && (
+        {(mode === 'materials' || mode === 'shapes' || mode === 'motion') && (
           <div className="row">
             <label htmlFor="material">Material</label>
             <select

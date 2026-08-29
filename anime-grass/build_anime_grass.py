@@ -89,6 +89,9 @@ def load_normal_image() -> bpy.types.Image:
     img = bpy.data.images.load(str(NORMAL_PATH))
     img.colorspace_settings.name = "Non-Color"
     img.name = "GrassNormal"
+    # Pack so the .blend works on other machines without the textures/ folder
+    if img.packed_file is None:
+        img.pack()
     return img
 
 

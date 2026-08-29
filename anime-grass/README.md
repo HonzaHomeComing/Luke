@@ -13,7 +13,16 @@ You do **not** need the full `.blend` from the tutorial — the normal map is th
 blender anime-grass/anime_grass.blend
 ```
 
-Select `Ground` → modifier **AnimeGrass**. Move/scale the `TexSync` empty to slide the painted shadow pattern.
+## View it correctly
+The cel shading **only shows in Eevee Rendered view**:
+
+1. Render engine: **Eevee** (Render Properties)
+2. Viewport shading: **Rendered** (top-right sphere, or `Z` → Rendered)
+3. Color Management → View Transform: **Standard**
+
+**Solid** / wireframe mode will look flat — that’s normal.
+
+Move/scale the `TexSync` empty to slide the painted shadow pattern.
 
 ## Rebuild
 ```bash

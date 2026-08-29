@@ -580,6 +580,22 @@ def setup_scene():
     return cam, empty
 
 
+def set_viewport_rendered():
+    """Cel/Emission shading only appears in Rendered view — save that as default."""
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type != "VIEW_3D":
+                    continue
+                space.shading.type = "RENDERED"
+                if hasattr(space.shading, "use_scene_lights"):
+                    space.shading.use_scene_lights = True
+                if hasattr(space.shading, "use_scene_world"):
+                    space.shading.use_scene_world = True
+
+
 def configure_render(scene):
     engines = {e.identifier for e in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items}
     scene.render.engine = "BLENDER_EEVEE_NEXT" if "BLENDER_EEVEE_NEXT" in engines else "BLENDER_EEVEE"
@@ -593,6 +609,7 @@ def configure_render(scene):
     scene.frame_start = 1
     scene.frame_end = 48
     scene.render.fps = 24
+    set_viewport_rendered()
 
 
 def render_still(scene, path: Path, frame: int):

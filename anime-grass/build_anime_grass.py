@@ -233,23 +233,25 @@ def create_ground(size=8.0, cuts=72):
 # ---------------------------------------------------------------------------
 
 def make_grass_material(normal_img: bpy.types.Image, empty: bpy.types.Object) -> bpy.types.Material:
+    """Soft painted clump shading from the normal map — no Eevee shadows, no black cel."""
     mat = bpy.data.materials.new("AnimeGrass")
     mat.use_nodes = True
     mat.blend_method = "OPAQUE"
     if hasattr(mat, "shadow_method"):
         mat.shadow_method = "NONE"
+    if hasattr(mat, "use_transparent_shadow"):
+        mat.use_transparent_shadow = False
     if hasattr(mat, "use_backface_culling"):
-        mat.use_backface_culling = True
+        mat.use_backface_culling = False
 
     nt = mat.node_tree
     nt.nodes.clear()
-    out = node(nt, "ShaderNodeOutputMaterial", (1200, 40))
+    out = node(nt, "ShaderNodeOutputMaterial", (1100, 40))
 
-    # Object-space coords from Empty — syncs ground + grass (tutorial trick)
     texcoord = node(nt, "ShaderNodeTexCoord", (-1000, 40))
     texcoord.object = empty
     mapping = node(nt, "ShaderNodeMapping", (-800, 40))
-    mapping.inputs["Scale"].default_value = (0.16, 0.16, 0.16)
+    mapping.inputs["Scale"].default_value = (0.10, 0.10, 0.10)
     link(nt, texcoord.outputs["Object"], mapping.inputs["Vector"])
 
     ntex = node(nt, "ShaderNodeTexImage", (-580, 40))
@@ -257,71 +259,64 @@ def make_grass_material(normal_img: bpy.types.Image, empty: bpy.types.Object) ->
     ntex.interpolation = "Cubic"
     link(nt, mapping.outputs["Vector"], ntex.inputs["Vector"])
 
-    # Normal Map in WORLD space (tutorial)
-    nmap = node(nt, "ShaderNodeNormalMap", (-320, -200))
+    nmap = node(nt, "ShaderNodeNormalMap", (-360, -160))
     nmap.space = "WORLD"
-    nmap.inputs["Strength"].default_value = 2.4
+    nmap.inputs["Strength"].default_value = 1.0
     link(nt, ntex.outputs["Color"], nmap.inputs["Color"])
 
-    # Color variation + hard painted shadow blobs from the normal map
-    rgb2bw = node(nt, "ShaderNodeRGBToBW", (-320, 200))
-    link(nt, ntex.outputs["Color"], rgb2bw.inputs["Color"])
-    paint = node(nt, "ShaderNodeValToRGB", (-100, 220))
-    paint.color_ramp.interpolation = "LINEAR"
-    paint.color_ramp.elements[0].position = 0.2
-    paint.color_ramp.elements[0].color = (0.10, 0.32, 0.09, 1)  # deep painted shadow
-    paint.color_ramp.elements[1].position = 0.8
-    paint.color_ramp.elements[1].color = (0.78, 0.94, 0.30, 1)  # bright lime
-    mid = paint.color_ramp.elements.new(0.48)
-    mid.color = (0.28, 0.58, 0.15, 1)
-    link(nt, rgb2bw.outputs["Val"], paint.inputs["Fac"])
+    # Shade factor = painted mounds · light (smooth 0..1)
+    light = node(nt, "ShaderNodeVectorMath", (-360, -320), operation="NORMALIZE")
+    light.inputs[0].default_value = (0.50, 0.45, 0.75)
+    ndot = node(nt, "ShaderNodeVectorMath", (-140, -240), operation="DOT_PRODUCT")
+    link(nt, nmap.outputs["Normal"], ndot.inputs[0])
+    link(nt, light.outputs["Vector"], ndot.inputs[1])
+    mapr = node(nt, "ShaderNodeMapRange", (60, -240))
+    mapr.clamp = True
+    mapr.inputs["From Min"].default_value = -0.05
+    mapr.inputs["From Max"].default_value = 0.65
+    mapr.inputs["To Min"].default_value = 0.0
+    mapr.inputs["To Max"].default_value = 1.0
+    link(nt, ndot.outputs["Value"], mapr.inputs["Value"])
 
-    mix_d = node(nt, "ShaderNodeMix", (-100, 20), data_type="RGBA")
-    mix_d.inputs["A"].default_value = (0.76, 0.60, 0.38, 1)
-    mix_d.inputs["B"].default_value = (0.48, 0.36, 0.22, 1)
-    link(nt, rgb2bw.outputs["Val"], mix_d.inputs["Factor"])
+    # Soft anime greens — shade stays readable (never near-black)
+    grass = node(nt, "ShaderNodeValToRGB", (280, -80))
+    grass.color_ramp.interpolation = "LINEAR"
+    grass.color_ramp.elements[0].position = 0.0
+    grass.color_ramp.elements[0].color = (0.20, 0.48, 0.14, 1)  # soft shade
+    grass.color_ramp.elements[1].position = 1.0
+    grass.color_ramp.elements[1].color = (0.78, 0.94, 0.40, 1)  # lit lime
+    mid = grass.color_ramp.elements.new(0.42)
+    mid.color = (0.42, 0.72, 0.22, 1)
+    link(nt, mapr.outputs["Result"], grass.inputs["Fac"])
 
-    attr = node(nt, "ShaderNodeAttribute", (-320, -40))
+    dirt = node(nt, "ShaderNodeValToRGB", (280, 160))
+    dirt.color_ramp.interpolation = "LINEAR"
+    dirt.color_ramp.elements[0].position = 0.0
+    dirt.color_ramp.elements[0].color = (0.50, 0.38, 0.24, 1)
+    dirt.color_ramp.elements[1].position = 1.0
+    dirt.color_ramp.elements[1].color = (0.86, 0.70, 0.48, 1)
+    link(nt, mapr.outputs["Result"], dirt.inputs["Fac"])
+
+    attr = node(nt, "ShaderNodeAttribute", (60, 80))
     attr.attribute_name = MASK_NAME
-    mix_t = node(nt, "ShaderNodeMix", (160, 100), data_type="RGBA")
+    mix_t = node(nt, "ShaderNodeMix", (520, 40), data_type="RGBA")
     link(nt, attr.outputs["Color"], mix_t.inputs["Factor"])
-    link(nt, mix_d.outputs["Result"], mix_t.inputs["A"])
-    link(nt, paint.outputs["Color"], mix_t.inputs["B"])
+    link(nt, dirt.outputs["Color"], mix_t.inputs["A"])
+    link(nt, grass.outputs["Color"], mix_t.inputs["B"])
 
-    # Wind darken
-    wattr = node(nt, "ShaderNodeAttribute", (-100, -300))
+    wattr = node(nt, "ShaderNodeAttribute", (280, -280))
     wattr.attribute_name = WIND_ATTR
-    wmul = node(nt, "ShaderNodeMath", (160, -300), operation="MULTIPLY")
-    wmul.inputs[1].default_value = 0.35
+    wmul = node(nt, "ShaderNodeMath", (520, -280), operation="MULTIPLY")
+    wmul.inputs[1].default_value = 0.15
     link(nt, wattr.outputs["Fac"], wmul.inputs[0])
-    mix_w = node(nt, "ShaderNodeMix", (360, 40), data_type="RGBA")
-    mix_w.inputs["B"].default_value = (0.10, 0.28, 0.09, 1)
+    mix_w = node(nt, "ShaderNodeMix", (720, 20), data_type="RGBA")
+    mix_w.inputs["B"].default_value = (0.22, 0.45, 0.14, 1)
     link(nt, wmul.outputs["Value"], mix_w.inputs["Factor"])
     link(nt, mix_t.outputs["Result"], mix_w.inputs["A"])
 
-    # Cel: Diffuse lit by YOUR normals → Shader to RGB → hard ramp
-    diffuse = node(nt, "ShaderNodeBsdfDiffuse", (160, -140))
-    diffuse.inputs["Color"].default_value = (1, 1, 1, 1)
-    link(nt, nmap.outputs["Normal"], diffuse.inputs["Normal"])
-    sh2rgb = node(nt, "ShaderNodeShaderToRGB", (360, -140))
-    link(nt, diffuse.outputs["BSDF"], sh2rgb.inputs["Shader"])
-
-    cel = node(nt, "ShaderNodeValToRGB", (560, -140))
-    cel.color_ramp.interpolation = "CONSTANT"
-    cel.color_ramp.elements[0].position = 0.0
-    cel.color_ramp.elements[0].color = (0.40, 0.34, 0.62, 1)
-    cel.color_ramp.elements[1].position = 0.58
-    cel.color_ramp.elements[1].color = (1.0, 1.0, 0.97, 1)
-    link(nt, sh2rgb.outputs["Color"], cel.inputs["Fac"])
-
-    mul = node(nt, "ShaderNodeMix", (800, 20), data_type="RGBA", blend_type="MULTIPLY")
-    mul.inputs["Factor"].default_value = 1.0
-    link(nt, mix_w.outputs["Result"], mul.inputs["A"])
-    link(nt, cel.outputs["Color"], mul.inputs["B"])
-
-    emit = node(nt, "ShaderNodeEmission", (1000, 20))
+    emit = node(nt, "ShaderNodeEmission", (920, 20))
     emit.inputs["Strength"].default_value = 1.0
-    link(nt, mul.outputs["Result"], emit.inputs["Color"])
+    link(nt, mix_w.outputs["Result"], emit.inputs["Color"])
     link(nt, emit.outputs["Emission"], out.inputs["Surface"])
     return mat
 
@@ -563,20 +558,25 @@ def setup_scene():
     cam.rotation_euler = Euler((math.radians(55), 0, math.radians(45)), "XYZ")
     bpy.context.scene.camera = cam
 
+    # Soft sun for Shader-to-RGB only — shadows stay OFF (thin grass acne).
     sun = bpy.data.objects.new("Sun", bpy.data.lights.new("Sun", "SUN"))
     bpy.context.collection.objects.link(sun)
-    sun.rotation_euler = Euler((math.radians(38), math.radians(10), math.radians(130)), "XYZ")
-    sun.data.energy = 5.5
-    sun.data.angle = math.radians(1.2)
-    sun.data.color = (1.0, 0.98, 0.92)
+    sun.rotation_euler = Euler((math.radians(42), math.radians(8), math.radians(135)), "XYZ")
+    sun.data.energy = 4.5
+    sun.data.angle = math.radians(12.0)
+    sun.data.color = (1.0, 0.98, 0.94)
+    if hasattr(sun.data, "use_shadow"):
+        sun.data.use_shadow = False
 
     fill = bpy.data.objects.new("Fill", bpy.data.lights.new("Fill", "AREA"))
     bpy.context.collection.objects.link(fill)
     fill.location = (-5, -2, 3.5)
     fill.rotation_euler = Euler((math.radians(65), 0, math.radians(-45)), "XYZ")
-    fill.data.energy = 12
-    fill.data.size = 7
-    fill.data.color = (0.7, 0.8, 1.0)
+    fill.data.energy = 2.5
+    fill.data.size = 9
+    fill.data.color = (0.75, 0.85, 1.0)
+    if hasattr(fill.data, "use_shadow"):
+        fill.data.use_shadow = False
     return cam, empty
 
 
@@ -650,6 +650,8 @@ def configure_render(scene):
     scene.view_settings.look = "None"
     if hasattr(scene.eevee, "taa_render_samples"):
         scene.eevee.taa_render_samples = 64
+    if hasattr(scene.eevee, "use_shadows"):
+        scene.eevee.use_shadows = False
     scene.frame_start = 1
     scene.frame_end = 48
     scene.render.fps = 24
